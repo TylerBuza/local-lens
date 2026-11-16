@@ -60,6 +60,8 @@ not Local Lens, but it's worth checking if you copy sensitive text.
 - **Box select.** Drag a box on an empty spot to grab everything inside it.
 - **Keeps tables tidy.** Selected text is rebuilt row by row, so a receipt label stays next to its
   price, even in a slightly tilted photo.
+- **Reads sideways photos.** If a photo is rotated (a card shot sideways, a phone screenshot turned
+  90°), Local Lens detects the orientation and reads it anyway. Small images are upscaled first.
 - **Handles big text.** Large signs and headings get an extra OCR pass at a smaller size, which
   Windows OCR reads more reliably.
 - **Select all and copy.** Selections are copied to the clipboard automatically.

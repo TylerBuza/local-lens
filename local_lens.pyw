@@ -67,13 +67,74 @@ def _overlap(a, b):
     return ix * iy / area
 
 
-def ocr_image(img: Image.Image, lang: str):
-    """Return (words, text). Each word: {'text', 'line', 'box': (x0, y0, x1, y1)} in img coords.
+# Windows OCR only reads upright text. Sideways/upside-down photos are retried rotated.
+ROTATIONS = {90: Image.ROTATE_90, 270: Image.ROTATE_270, 180: Image.ROTATE_180}
+COMMON_WORDS = set("""the be to of and in that have it for not on with he as you do at this but his by
+from they we say her she or an will my one all would there their what so up out if about who get which
+go me when make can like time no just him know take people into year your good some could them see
+other than then now look only come its over think also back after use two how our work first well way
+even new want because any these give day most us is are was were has had been am may per off
+""".split())
 
-    Windows OCR reads normal-sized text well but misses very large text (signs, headings),
-    so big images get extra downscaled passes whose large words are merged in.
+
+def _text_score(lines):
+    """How much the OCR result looks like real text (used to pick the right orientation)."""
+    score = 0
+    for ln in lines:
+        for w in ln:
+            t = w["text"].strip(".,:;!?\"'()[]{}")
+            if len(t) < 2:
+                continue
+            if t.lower() in COMMON_WORDS:
+                score += 3 * len(t)
+            elif t.isdigit() and len(t) >= 3:
+                score += len(t)
+            elif t.isalpha() and (t.islower() or t.isupper() or t.istitle()) \
+                    and any(c in "aeiouyAEIOUY" for c in t):
+                score += len(t)
+    return score
+
+
+def _unrotate_box(b, rot, W, H):
+    """Map a box from an image rotated by `rot` (PIL transpose) back to the original W x H image."""
+    x0, y0, x1, y1 = b
+    if rot == 90:  # rotated (u, v) -> original (W - v, u)
+        return (W - y1, x0, W - y0, x1)
+    if rot == 270:  # rotated (u, v) -> original (v, H - u)
+        return (y0, H - x1, y1, H - x0)
+    if rot == 180:
+        return (W - x1, H - y1, W - x0, H - y0)
+    return b
+
+
+def ocr_image(img: Image.Image, lang: str):
+    """Return (words, text). Each word: {'text', 'line', 'rot', 'box', 'rbox'}.
+
+    'box' is in original image coords; 'rbox' is in the upright (reading) frame, used for
+    ordering text. If the image has little readable text upright, rotated versions are tried
+    and the orientation that reads best wins (photos of cards, sideways screenshots, etc.).
     """
     img = img.convert("RGB")
+    W, H = img.size
+    lines, rot = _ocr_multiscale(img, lang), 0
+    best = _text_score(lines)
+    if best < 80:
+        for r, op in ROTATIONS.items():
+            cand = _ocr_multiscale(img.transpose(op), lang)
+            sc = _text_score(cand)
+            if sc > best * 1.5 + 10:
+                lines, rot, best = cand, r, sc
+    words = []
+    for li, ln in enumerate(lines):
+        for w in ln:
+            words.append({"text": w["text"], "line": li, "rot": rot, "rbox": w["box"],
+                          "box": _unrotate_box(w["box"], rot, W, H)})
+    return words, "\n".join(" ".join(w["text"] for w in ln) for ln in lines).strip()
+
+
+def _ocr_multiscale(img: Image.Image, lang: str):
+    """Windows OCR reads normal-sized text well but misses very large text (signs, headings),
+    so big images get extra downscaled passes whose large words are merged in."""
     lines = _ocr_lines(img, lang)
     heights = sorted(w["box"][3] - w["box"][1] for ln in lines for w in ln)
     base_h = heights[len(heights) // 2] if heights else 0
@@ -91,19 +152,21 @@ def ocr_image(img: Image.Image, lang: str):
             top = min(w["box"][1] for w in ln)
             pos = next((i for i, l2 in enumerate(lines) if min(o["box"][1] for o in l2) > top), len(lines))
             lines.insert(pos, ln)
-    words = []
-    for li, ln in enumerate(lines):
-        for w in ln:
-            words.append({"text": w["text"], "line": li, "box": w["box"]})
-    return words, "\n".join(" ".join(w["text"] for w in ln) for ln in lines).strip()
+    return lines
 
 
 def _ocr_lines(img: Image.Image, lang: str):
     """One Windows OCR pass. Returns a list of lines, each a list of {'text', 'box'}."""
     f = 1.0
     w, h = img.size
-    if min(w, h) < 300:  # small crops read much better upscaled
-        s = min(3, 300 // max(1, min(w, h)) + 1)
+    # Small images and thin crops read much better upscaled.
+    s = 1
+    if min(w, h) < 300:
+        s = max(s, 300 // max(1, min(w, h)) + 1)
+    if max(w, h) < 1000:
+        s = max(s, -(-1000 // max(1, max(w, h))))
+    s = min(s, 4)
+    if s > 1:
         img = img.resize((w * s, h * s), Image.LANCZOS)
         f *= s
     w, h = img.size
@@ -149,7 +212,7 @@ def estimate_skew(words):
     for ws in by_line.values():
         if len(ws) < 2:
             continue
-        a, b = ws[0]["box"], ws[-1]["box"]
+        a, b = ws[0].get("rbox", ws[0]["box"]), ws[-1].get("rbox", ws[-1]["box"])
         dx = (b[0] + b[2]) / 2 - (a[0] + a[2]) / 2
         if dx > (a[3] - a[1]) * 2:
             slopes.append(((b[1] + b[3]) / 2 - (a[1] + a[3]) / 2) / dx)
@@ -163,7 +226,7 @@ def words_to_rows_text(words, skew=0.0):
         return ""
     items = []
     for w in words:
-        x0, y0, x1, y1 = w["box"]
+        x0, y0, x1, y1 = w.get("rbox", w["box"])
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
         items.append((cy - cx * skew, x0, y1 - y0, w["text"]))
     items.sort()
@@ -538,8 +601,12 @@ class LocalLens(BaseTk):
         """Word box in display-image coords (no canvas offset)."""
         x0, y0, x1, y1 = (v * self.scale for v in w["box"])
         if pad:
-            h = y1 - y0
-            x0, x1, y0, y1 = x0 - h * 0.22, x1 + h * 0.22, y0 - h * 0.14, y1 + h * 0.14
+            if w.get("rot") in (90, 270):  # sideways text: the box width is the text height
+                h = x1 - x0
+                x0, x1, y0, y1 = x0 - h * 0.14, x1 + h * 0.14, y0 - h * 0.22, y1 + h * 0.22
+            else:
+                h = y1 - y0
+                x0, x1, y0, y1 = x0 - h * 0.22, x1 + h * 0.22, y0 - h * 0.14, y1 + h * 0.14
         return (max(0, x0), max(0, y0), min(self.dsize[0], x1), min(self.dsize[1], y1))
 
     def _mask_for(self, words):
@@ -628,7 +695,10 @@ class LocalLens(BaseTk):
             x0, y0, x1, y1 = self._wrect(w)
             ddx = max(x0 - dx, 0, dx - x1)
             ddy = max(y0 - dy, 0, dy - y1)
-            d = ddx * ddx + (ddy * 3) ** 2  # prefer staying on the same line
+            if w.get("rot") in (90, 270):  # prefer staying on the same line
+                d = (ddx * 3) ** 2 + ddy * ddy
+            else:
+                d = ddx * ddx + (ddy * 3) ** 2
             if bd is None or d < bd:
                 best, bd = i, d
         return best
