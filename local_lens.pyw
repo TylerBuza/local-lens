@@ -132,6 +132,208 @@ def ocr_image(img: Image.Image, lang: str):
     return words, "\n".join(" ".join(w["text"] for w in ln) for ln in lines).strip()
 
 
+def _rotate_box(b, rot, W, H):
+    """Inverse of _unrotate_box: map an original-image box into the frame rotated by `rot`."""
+    x0, y0, x1, y1 = b
+    if rot == 90:  # original (x, y) -> rotated (y, W - x)
+        return (y0, W - x1, y1, W - x0)
+    if rot == 270:  # original (x, y) -> rotated (H - y, x)
+        return (H - y1, x0, H - y0, x1)
+    if rot == 180:
+        return (W - x1, H - y1, W - x0, H - y0)
+    return b
+
+
+# ---------------------------------------------------------------- enhanced pass
+# Optional second engine (RapidOCR, PaddleOCR models, bundled in the package, runs offline).
+# Windows OCR misses thin, faint or tiny text in photos; RapidOCR finds those text regions.
+# Each new region is re-read by Windows OCR as a tight crop (keeps spaces and word boxes),
+# with RapidOCR's own reading as the fallback.
+_rapid = None
+_rapid_lock = threading.Lock()
+
+
+def get_rapid():
+    global _rapid
+    with _rapid_lock:
+        if _rapid is None:
+            try:
+                import logging
+
+                logging.disable(logging.WARNING)
+                from rapidocr_onnxruntime import RapidOCR
+
+                _rapid = RapidOCR()
+            except Exception:
+                _rapid = False
+        return _rapid or None
+
+
+def _norm(s):
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _inside(bb, words):
+    """Words whose center lies inside box bb (with a little margin)."""
+    m = 0.3 * min(bb[2] - bb[0], bb[3] - bb[1])
+    bb = (bb[0] - m, bb[1] - m, bb[2] + m, bb[3] + m)
+    out = []
+    for w in words:
+        b = w["box"]
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        if bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3]:
+            out.append(w)
+    return out
+
+
+def _known_frac(texts):
+    """Share of tokens that are real words (wordninja's offline dictionary) or numbers."""
+    try:
+        import wordninja
+
+        vocab = wordninja.DEFAULT_LANGUAGE_MODEL._wordcost
+    except Exception:
+        return 0.0
+    toks = [_norm(t) for t in texts for t in t.split()]
+    toks = [t for t in toks if t]
+    if not toks:
+        return 0.0
+    return sum(1 for t in toks if t.isdigit() or (len(t) > 1 and t in vocab)) / len(toks)
+
+
+def _split_line(text, bb, rot):
+    """Turn one detected line into words with estimated boxes.
+
+    The extra engine often drops spaces ("HAVEYOURCARDTO"), so long letters-only runs are
+    split into words with wordninja (offline, bundled word list). URLs etc. are left alone.
+    """
+    tokens = []
+    for tok in text.split():
+        if tok.isalpha() and len(tok) >= 8:
+            try:
+                import wordninja
+
+                parts = wordninja.split(tok) or [tok]
+                junk = sum(1 for p in parts if len(p) <= 2 and p.lower() not in COMMON_WORDS
+                           and p.upper() not in ("A", "I"))
+                tokens += parts if junk <= len(parts) / 4 else [tok]
+                continue
+            except Exception:
+                pass
+        tokens.append(tok)
+    total = max(1, sum(len(t) for t in tokens) + len(tokens) - 1)
+    x0, y0, x1, y1 = bb
+    w, h = x1 - x0, y1 - y0
+    out, pos = [], 0
+    for t in tokens:
+        a, b = pos / total, (pos + len(t)) / total
+        pos += len(t) + 1
+        if rot == 90:  # reads top to bottom
+            box = (x0, y0 + a * h, x1, y0 + b * h)
+        elif rot == 270:  # reads bottom to top
+            box = (x0, y1 - b * h, x1, y1 - a * h)
+        else:
+            box = (x0 + a * w, y0, x0 + b * w, y1)
+        out.append({"text": t, "rot": rot, "box": box})
+    return out
+
+
+def enhance_words(img: Image.Image, words, lang: str):
+    """Return a new word list: `words` plus text the extra engine found in uncovered areas."""
+    eng = get_rapid()
+    if not eng:
+        return words
+    import difflib
+
+    import numpy as np
+
+    img = img.convert("RGB")
+    W, H = img.size
+    page_rot = words[0]["rot"] if words else 0
+    with _rapid_lock:
+        res, _ = eng(np.array(img)[:, :, ::-1].copy())
+    new_lines, removed = [], set()
+    for quad, text, conf in res or []:
+        if float(conf) < 0.6 or len(_norm(text)) < 1:
+            continue
+        xs, ys = [p[0] for p in quad], [p[1] for p in quad]
+        bb = (max(0, min(xs)), max(0, min(ys)), min(W, max(xs)), min(H, max(ys)))
+        if bb[2] - bb[0] < 3 or bb[3] - bb[1] < 3:
+            continue
+        inside = [w for w in _inside(bb, words) if id(w) not in removed]
+        if sum(len(_norm(w["text"])) for w in inside) > 0.5 * len(_norm(text)):
+            # Already read by Windows OCR. Replace it only if Windows' reading is gibberish
+            # and this one is made of real words (e.g. "qarfilla" -> "Vanilla").
+            old = [w["text"] for w in inside]
+            if not (float(conf) >= 0.8 and _known_frac([text]) >= _known_frac(old) + 0.5
+                    and difflib.SequenceMatcher(None, _norm("".join(old)), _norm(text)).ratio() < 0.85):
+                continue
+            removed.update(id(w) for w in inside)
+            vertical = (bb[3] - bb[1]) > 1.5 * (bb[2] - bb[0]) and len(_norm(text)) > 1
+            rot = inside[0]["rot"] if inside else 0
+            line = _split_line(text, bb, rot if vertical or rot else 0)
+            for w in line:
+                w["rbox"] = _rotate_box(w["box"], page_rot, W, H)
+            new_lines.append(line)
+            continue
+        vertical = (bb[3] - bb[1]) > 1.5 * (bb[2] - bb[0]) and len(_norm(text)) > 1
+        m = 0.15 * min(bb[2] - bb[0], bb[3] - bb[1]) + 2
+        cb = (int(max(0, bb[0] - m)), int(max(0, bb[1] - m)), int(min(W, bb[2] + m)), int(min(H, bb[3] + m)))
+        crop = img.crop(cb)
+        best = None
+        for rot in ((90, 270) if vertical else (0,)):
+            c = crop.transpose(ROTATIONS[rot]) if rot else crop
+            ws = [w for ln in _ocr_lines(c, lang) for w in ln]
+            ratio = difflib.SequenceMatcher(None, _norm("".join(w["text"] for w in ws)), _norm(text)).ratio()
+            if ws and (best is None or ratio > best[0]):
+                best = (ratio, rot, ws)
+        line = []
+        if best and best[0] >= 0.6:
+            ratio, rot, ws = best
+            for w in ws:
+                b = _unrotate_box(w["box"], rot, crop.width, crop.height)
+                line.append({"text": w["text"], "rot": rot,
+                             "box": (b[0] + cb[0], b[1] + cb[1], b[2] + cb[0], b[3] + cb[1])})
+        elif float(conf) >= 0.75:  # fall back to the extra engine's own reading
+            rot = (page_rot if page_rot in (90, 270) else 90) if vertical else 0
+            line = _split_line(text, bb, rot)
+        if not line:
+            continue
+        for w in line:
+            w["rbox"] = _rotate_box(w["box"], page_rot, W, H)
+        new_lines.append(line)
+    if not new_lines:
+        return words
+
+    # Insert new lines among the existing ones by position in the reading frame.
+    lines = []
+    for w in words:
+        if id(w) in removed:
+            continue
+        if not lines or lines[-1][0]["line"] != w["line"]:
+            lines.append([])
+        lines[-1].append(w)
+    for ln in new_lines:
+        top = min(w["rbox"][1] for w in ln)
+        pos = next((i for i, l2 in enumerate(lines) if min(o["rbox"][1] for o in l2) > top), len(lines))
+        lines.insert(pos, ln)
+    out = []
+    for li, ln in enumerate(lines):
+        for w in ln:
+            w["line"] = li
+            out.append(w)
+    return out
+
+
+def ocr_crop(img: Image.Image, lang: str):
+    """OCR for a user-drawn box: Windows OCR first, the extra engine if that finds nothing."""
+    words, text = ocr_image(img, lang)
+    if not text:
+        words = enhance_words(img, [], lang)
+        text = words_to_rows_text(words, 0.0) if words else ""
+    return words, text
+
+
 def _ocr_multiscale(img: Image.Image, lang: str):
     """Windows OCR reads normal-sized text well but misses very large text (signs, headings),
     so big images get extra downscaled passes whose large words are merged in."""
@@ -311,6 +513,9 @@ class LocalLens(BaseTk):
         self.skew = 0.0
         self.sel = set()
         self.busy = False
+        self.enhancing = False
+        self.gen = 0
+        threading.Thread(target=get_rapid, daemon=True).start()  # load the extra engine early
         self.mode = None
         self.anchor = None
         self.box_start = None
@@ -527,6 +732,8 @@ class LocalLens(BaseTk):
         if self.busy:
             return
         self.image = None
+        self.gen += 1
+        self.enhancing = False
         self.words, self.sel = [], set()
         self.disp = self.dim = self.lit = self.round_mask = None
         self.tk_img = None
@@ -544,6 +751,8 @@ class LocalLens(BaseTk):
             bg.paste(img, mask=img.split()[3])
             img = bg
         self.image = img.convert("RGB")
+        self.gen += 1
+        self.enhancing = False
         self.words, self.sel = [], set()
         self._clear_brackets()
         self.text.delete("1.0", tk.END)
@@ -759,7 +968,7 @@ class LocalLens(BaseTk):
             if not self.sel:
                 box = self._box_to_image(x0, y0, e.x, e.y)
                 if box:
-                    self.run_ocr(self.image.crop(box), self._crop_done)
+                    self.run_ocr(self.image.crop(box), self._crop_done, fn=ocr_crop)
                 return
         if self.sel and mode:
             self.copy_text(quiet_if_empty=True)
@@ -801,7 +1010,10 @@ class LocalLens(BaseTk):
             self.text.insert("1.0", words_to_text(self.words))
             self.sheet_title.set(f"All text · {len(self.words)} words  —  click or drag on the image to select")
         elif self.image is not None and not self.busy:
-            self.sheet_title.set("No text found — try dragging a box around the text")
+            self.sheet_title.set("Still looking…" if self.enhancing
+                                 else "No text found — try dragging a box around the text")
+        if self.enhancing and self.words:
+            self.sheet_title.set(self.sheet_title.get() + "  · finding more text…")
 
     def select_all(self):
         if self.words:
@@ -821,7 +1033,8 @@ class LocalLens(BaseTk):
         self.toast("Copied to clipboard", 1500)
 
     # -------------------------------------------------------------- OCR runner
-    def run_ocr(self, img, callback):
+    def run_ocr(self, img, callback, fn=None):
+        fn = fn or ocr_image
         self.busy = True
         self._build_lit()
         self._compose()
@@ -833,7 +1046,7 @@ class LocalLens(BaseTk):
 
         def work():
             try:
-                result["v"], result["err"] = ocr_image(img, lang), None
+                result["v"], result["err"] = fn(img, lang), None
             except Exception as ex:
                 result["v"], result["err"] = ([], ""), ex
 
@@ -879,8 +1092,56 @@ class LocalLens(BaseTk):
         self._update_sheet()
         if words:
             self.toast(f"Found {len(words)} words — click, drag, or Select all")
-        else:
+        elif not get_rapid():
             self.toast("No text found")
+        self._start_enhance()
+
+    def _start_enhance(self):
+        """Second pass with the extra engine, in the background; results merge in when ready."""
+        if _rapid is False or self.image is None:
+            return
+        gen, img, lang = self.gen, self.image, self.lang.get()
+        copies = [dict(w) for w in self.words]
+        old_index = {id(w): i for i, w in enumerate(copies)}
+        result = {}
+        self.enhancing = True
+        self._update_sheet()
+
+        def work():
+            try:
+                result["v"] = enhance_words(img, copies, lang)
+            except Exception:
+                result["v"] = None
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+
+        def check():
+            if t.is_alive():
+                self.after(80, check)
+                return
+            if gen != self.gen:  # a different image was loaded or cleared meanwhile
+                return
+            self.enhancing = False
+            new = result["v"]
+            added = len(new) - len(self.words) if new else 0
+            if new is not None and new is not copies:
+                remap = {old_index[id(w)]: ni for ni, w in enumerate(new) if id(w) in old_index}
+                self.sel = {remap[i] for i in self.sel if i in remap}
+                self.words = new
+                self.skew = estimate_skew(new)
+                self._build_lit()
+                self._compose()
+                if added > 0:
+                    self.toast(f"Found {added} more word{'s' if added != 1 else ''}")
+            elif not self.words:
+                self.toast("No text found")
+            if not self.sel:
+                self._update_sheet()
+            else:
+                self.sheet_title.set(self.sheet_title.get().replace("  · finding more text…", ""))
+
+        self.after(80, check)
 
     def _crop_done(self, words, text):
         self._build_lit()

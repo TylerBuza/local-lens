@@ -39,7 +39,7 @@ def main():
 
     def load(name):
         app.load_image(Image.open(os.path.join(ASSETS, "demo", name)))
-        while app.busy:
+        while app.busy or app.enhancing:
             pump(2)
         pump(10)
 

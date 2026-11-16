@@ -35,11 +35,11 @@ is read on your own machine and goes nowhere else. It even works with your Wi-Fi
 | | |
 | --- | --- |
 | 🌐 **No network access** | The app contains no networking code. It never connects to the internet. |
-| 🧠 **On-device OCR** | Text is recognized by Windows' built-in `Windows.Media.Ocr` engine, on your CPU. |
+| 🧠 **On-device OCR** | Text is recognized on your CPU by Windows' built-in OCR engine, plus RapidOCR, whose AI models ship inside the package (no model downloads). |
 | 💾 **Nothing saved** | Images and text stay in memory only. Nothing is written to disk unless *you* click **Save image**. |
 | 🧹 **One click to forget** | **Clear** (or `Delete`) drops the image and text from memory immediately. Closing the app does the same. |
 | 📊 **No telemetry** | No analytics, no crash reporting, no accounts, no "phone home". |
-| 🔍 **Easy to audit** | The whole app is one readable file, [`local_lens.pyw`](local_lens.pyw), about 850 lines. |
+| 🔍 **Easy to audit** | The whole app is one readable file, [`local_lens.pyw`](local_lens.pyw), about 1,200 lines. |
 
 **One thing to know:** when you copy text, it goes to the Windows clipboard like any copy does. If
 you've turned on **clipboard history sync** (Settings → System → Clipboard → *Sync across your
@@ -64,6 +64,9 @@ not Local Lens, but it's worth checking if you copy sensitive text.
   90°), Local Lens detects the orientation and reads it anyway. Small images are upscaled first.
 - **Handles big text.** Large signs and headings get an extra OCR pass at a smaller size, which
   Windows OCR reads more reliably.
+- **Two engines for photos.** Results appear instantly from Windows OCR, then a second engine
+  (RapidOCR) looks for text Windows missed, such as small print, faint or thin lettering, and text
+  on cards, and merges it in a few seconds later. It also fixes words Windows garbled.
 - **Select all and copy.** Selections are copied to the clipboard automatically.
 - **Drag and drop** image files onto the window.
 - **Editable result.** Fix any typo in the text panel before copying.
@@ -78,7 +81,7 @@ cd local-lens
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-This installs the three Python packages and puts a **Local Lens** shortcut on your Desktop and in
+This installs the Python packages (about 100 MB, mostly the second OCR engine) and puts a **Local Lens** shortcut on your Desktop and in
 the Start menu. The installer is the only step that uses the internet, to download those packages.
 
 Prefer to run it by hand?
@@ -112,13 +115,18 @@ installed, a language picker appears in the top bar.
 
 ## Limits
 
-Windows OCR is great with printed text in screenshots, documents, signs and labels. It struggles
-with handwriting and very stylized lettering.
+Local Lens is great with printed text in screenshots, documents, signs, labels and cards. It
+struggles with handwriting, very stylized lettering, and text that is only a few pixels tall in a
+low-resolution photo. For the best results, use the sharpest image you have.
 
 ## How it works
 
 - **OCR:** [`Windows.Media.Ocr`](https://learn.microsoft.com/uwp/api/windows.media.ocr), called
-  through [`winocr`](https://github.com/GitHub30/winocr).
+  through [`winocr`](https://github.com/GitHub30/winocr), for instant results.
+- **Second engine:** [`RapidOCR`](https://github.com/RapidAI/RapidOCR) (PaddleOCR models on
+  ONNX Runtime) finds text regions Windows missed. Each region is re-read by Windows OCR where
+  possible, and run-together words are split with [`wordninja`](https://github.com/keredson/wordninja).
+  Both are optional: without them, Local Lens uses Windows OCR alone.
 - **UI:** Tkinter, with Pillow rendering the highlights.
 - **Drag and drop:** [`tkinterdnd2`](https://github.com/Eliav2/tkinterdnd2), optional.
 
